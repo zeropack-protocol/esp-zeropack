@@ -1,0 +1,3 @@
+[submodule "lib/zeropack"]
+	path = lib/zeropack
+	url = https://github.com/zeropack-protocol/zeropack.git
