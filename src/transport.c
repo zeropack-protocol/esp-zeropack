@@ -37,7 +37,7 @@ static int s_sock = -1;
 
 static zp_ssize_t esp_transport_writev(const zp_iovec_t* iov, int iovcnt) {
     if (s_sock < 0) return -1;
-    return lwip_writev(s_sock, (const struct iovec*)iov, iovcnt);
+    return writev(s_sock, (const struct iovec*)iov, iovcnt);
 }
 
 static zp_ssize_t esp_transport_recv(void* buf, size_t max_len) {
