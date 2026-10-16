@@ -26,8 +26,8 @@ TEST_CASE("Schema: tamaños, offsets y metadata correctos", "[zeropack]") {
     TEST_ASSERT_EQUAL_STRING("sensor_t", zp_schema.types[0].name);
     TEST_ASSERT_EQUAL(3, zp_schema.types[0].count);
 
-    // Verificamos que los offsets de cada campo coincidan con offsetof de
-    // hardware
+    // Verificamos que los offsets de cada campo coincidan con offsetof del
+    // compilador (ABI)
     TEST_ASSERT_EQUAL(
         offsetof(sensor_t, sensor_id), zp_schema.types[0].fields[0].offset
     );
@@ -100,7 +100,7 @@ TEST_CASE(
     zp_on_action(ACTION_UPDATE_DATA, on_sensor_update);
     zp_header_t valid_hdr = {.action = ACTION_UPDATE_DATA};
 
-    // sizeof(incomplete_payload) < sizeof(sensor_t)
+    // Payload incompleto: su longitud (2 bytes) es menor que sizeof(sensor_t)
     uint8_t incomplete_payload[2] = {0x01, 0x02};
 
     bool ok = zp_schema.dispatch(
@@ -141,7 +141,7 @@ TEST_CASE(
     poolref_t ref_struct = zp_pool_val(sensor_t, s);
     TEST_ASSERT_EQUAL_UINT16(str_slot_size, ref_struct);
 
-    // Recuperar el struct y probar mutación in-place (void*)
+    // Recuperar el struct y probar mutación in-place en el pool
     sensor_t* rec_s = zp_pool_get(ref_struct);
     TEST_ASSERT_EQUAL_UINT16(101, rec_s->sensor_id);
     TEST_ASSERT_EQUAL_INT32(24500, rec_s->temp_milli);
@@ -157,4 +157,70 @@ TEST_CASE(
     poolref_t ref_nuevo = zp_pool_str("Reinicio");
     TEST_ASSERT_EQUAL_UINT16(0, ref_nuevo);
     TEST_ASSERT_EQUAL_STRING("Reinicio", (char*)zp_pool_get(ref_nuevo));
+}
+
+TEST_CASE(
+    "Pipeline RX: zp_rx_get_buffer y zp_rx_commit con reensamblado",
+    "[zeropack]"
+) {
+    s_sensor.sensor_id = 0;
+    zp_on_action(ACTION_UPDATE_DATA, on_sensor_update);
+
+    // Probar recepción directa (Zero-Copy)
+    size_t avail = 0;
+    uint8_t* buf = zp_rx_get_buffer(&avail);
+    TEST_ASSERT_NOT_NULL(buf);
+    TEST_ASSERT_TRUE(avail >= sizeof(zp_header_t) + sizeof(sensor_t));
+
+    zp_header_t hdr = {
+        .action = ACTION_UPDATE_DATA,
+        .type_id = TYPE_ID_sensor_t,
+        .count = 1,
+    };
+    sensor_t sensor_in = {
+        .sensor_id = 777,
+        .temp_milli = 2100,
+        .is_active = true,
+    };
+
+    // Escribimos directo en el buffer de recepción prestado
+    memcpy(buf, &hdr, sizeof(hdr));
+    memcpy(buf + sizeof(hdr), &sensor_in, sizeof(sensor_in));
+
+    // Notificamos los bytes recibidos
+    zp_rx_commit(sizeof(hdr) + sizeof(sensor_in));
+
+    // Verificamos que el paquete fue parseado y el callback ejecutado
+    TEST_ASSERT_EQUAL_UINT16(777, s_sensor.sensor_id);
+    TEST_ASSERT_EQUAL_INT32(2100, s_sensor.temp_milli);
+    TEST_ASSERT_TRUE(s_sensor.is_active);
+
+    // Probar paquete fragmentado en 2 chunks (reensamblado en buffer)
+    s_sensor.sensor_id = 0;
+    sensor_in.sensor_id = 888;
+    sensor_in.temp_milli = -500;
+
+    buf = zp_rx_get_buffer(&avail);
+    TEST_ASSERT_NOT_NULL(buf);
+
+    // Chunk 1: solo 2 bytes del header
+    memcpy(buf, &hdr, 2);
+    zp_rx_commit(2);
+    TEST_ASSERT_EQUAL_UINT16(0, s_sensor.sensor_id);  // No debe disparar aún
+
+    // Chunk 2: el resto del header (2 bytes) + payload completo
+    buf = zp_rx_get_buffer(&avail);
+    TEST_ASSERT_NOT_NULL(buf);
+    memcpy(buf, ((const uint8_t*)&hdr) + 2, sizeof(hdr) - 2);
+    memcpy(buf + (sizeof(hdr) - 2), &sensor_in, sizeof(sensor_in));
+    zp_rx_commit((sizeof(hdr) - 2) + sizeof(sensor_in));
+
+    // Debe completarse el paquete tras el segundo chunk
+    TEST_ASSERT_EQUAL_UINT16(888, s_sensor.sensor_id);
+    TEST_ASSERT_EQUAL_INT32(-500, s_sensor.temp_milli);
+
+    // Verificamos que el buffer se haya compactado y liberado por completo
+    size_t final_avail = 0;
+    (void)zp_rx_get_buffer(&final_avail);
+    TEST_ASSERT_EQUAL_UINT32(ZP_BUFFER_SIZE, final_avail);
 }

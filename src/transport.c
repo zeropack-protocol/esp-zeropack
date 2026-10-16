@@ -1,10 +1,13 @@
 #include "zeropack/transport.h"
 
 #include <arpa/inet.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include "freertos/projdefs.h"
 #include "zeropack/core.h"
 
 #if __has_include(<lwip/sockets.h>)
@@ -92,9 +95,17 @@ static void zp_rx_task(void* pvParameters) {
             CONFIG_ZP_SERVER_PORT
         );
 
-        uint8_t rx_chunk[256];
         while (1) {
-            ssize_t len = recv(sock, rx_chunk, sizeof(rx_chunk), 0);
+            size_t avail = 0;
+            uint8_t* buf = zp_rx_get_buffer(&avail);
+
+            if (!buf || avail == 0) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+
+            ssize_t len = recv(sock, buf, avail, 0);
+
             if (len < 0) {
                 ESP_LOGE(
                     TAG, "recv() failed or socket closed, restarting connection"
@@ -105,7 +116,7 @@ static void zp_rx_task(void* pvParameters) {
                 break;
             }
 
-            zp_process_rx_bytes(rx_chunk, (size_t)len);
+            zp_rx_commit((size_t)len);
         }
 
         esp_transport_close();
