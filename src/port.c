@@ -51,7 +51,7 @@ void esp_unlock(zp_lock_target_t target, void* _) {
 
 zp_ssize_t esp_writev(const zp_iovec_t* iov, int iovcnt) {
     if (s_sock < 0) return -1;
-    return writev(s_sock, (const struct iovec*)iov, iovcnt);
+    return lwip_writev(s_sock, (const struct iovec*)iov, iovcnt);
 }
 
 static void zp_rx_task(void* pvParameters) {
