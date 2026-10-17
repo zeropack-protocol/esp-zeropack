@@ -10,27 +10,12 @@ menu "ZeroPack Configuration"
     help
       TCP port where the ZeroPack backend server listens for incomming connections.
 
-  config ZP_BUFFER_SIZE
-    int "Receive buffer size (bytes)"
-    default 1024
-    range 64 65536
-    help
-      Size in bytes for the static memory buffer used to receive incomming packets.
-      Must be 4-byte aligned and large enough to hold the maximum expected payload.
-  
   config ZP_STACK_SIZE
     int "RX task stack size (bytes)"
     default 4096
     range 2048 32768
     help
       Stack size allocated in bytes for the static FreeRTOS receive worker task.
-
-  config ZP_POOL_SIZE
-    int "Static memory pool size (bytes)"
-    default 1024
-    help
-      Size in bytes allocated for static string/state memory pool
-      Used for string interning and cached structs. Set to 0 if unused.
 
   config ZP_RECONNECT_DELAY_MS
     int "Reconnection retry delay (ms)"

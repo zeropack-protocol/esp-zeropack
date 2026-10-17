@@ -1,23 +1,18 @@
-#include "zeropack/transport.h"
+#include "port.h"
 
 #include <arpa/inet.h>
 #include <stddef.h>
-#include <stdint.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
-#include "freertos/projdefs.h"
-#include "zeropack/core.h"
-
-#if __has_include(<lwip/sockets.h>)
-#include "lwip/sockets.h"
-#endif
-
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "portmacro.h"
 #include "sdkconfig.h"
+#include "zeropack/core.h"
+#include "zeropack/types.h"
 
 _Static_assert(
     sizeof(CONFIG_ZP_SERVER_IP) > 1,
@@ -31,32 +26,36 @@ _Static_assert(
     "Component config -> ZeroPack."
 );
 
-static const char* TAG = "ZP transport";
+static const char* TAG = "ZP";
 
+static int s_sock = -1;
 static StackType_t s_rx_stack[CONFIG_ZP_STACK_SIZE];
 static StaticTask_t s_rx_tcb;
 
-static int s_sock = -1;
+static StaticSemaphore_t s_lock_bufs[2];
+static SemaphoreHandle_t s_locks[2];
 
-static zp_ssize_t esp_transport_writev(const zp_iovec_t* iov, int iovcnt) {
+__attribute__((constructor)) static void esp_locks_init(void) {
+    s_locks[ZP_LOCK_TX] = xSemaphoreCreateMutexStatic(&s_lock_bufs[ZP_LOCK_TX]);
+    s_locks[ZP_LOCK_POOL] =
+        xSemaphoreCreateMutexStatic(&s_lock_bufs[ZP_LOCK_POOL]);
+}
+
+void esp_lock(zp_lock_target_t target, void* _) {
+    xSemaphoreTake(s_locks[target], portMAX_DELAY);
+}
+
+void esp_unlock(zp_lock_target_t target, void* _) {
+    xSemaphoreGive(s_locks[target]);
+}
+
+zp_ssize_t esp_writev(const zp_iovec_t* iov, int iovcnt) {
     if (s_sock < 0) return -1;
     return writev(s_sock, (const struct iovec*)iov, iovcnt);
 }
 
-static zp_ssize_t esp_transport_recv(void* buf, size_t max_len) {
-    if (s_sock < 0) return -1;
-    return recv(s_sock, buf, max_len, 0);
-}
-
-static void esp_transport_close(void) {
-    if (s_sock >= 0) {
-        close(s_sock);
-        s_sock = -1;
-    }
-}
-
 static void zp_rx_task(void* pvParameters) {
-    (void)pvParameters;
+    zp_ctx_t* ctx = pvParameters;
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -86,7 +85,7 @@ static void zp_rx_task(void* pvParameters) {
         waiting_logged = false;
         s_sock = sock;
 
-        zp_send_handshake();
+        zp_send_handshake(ctx);
 
         ESP_LOGI(
             TAG,
@@ -96,8 +95,8 @@ static void zp_rx_task(void* pvParameters) {
         );
 
         while (1) {
-            size_t avail = 0;
-            uint8_t* buf = zp_rx_get_buffer(&avail);
+            size_t avail = zp_rx_avail(ctx);
+            uint8_t* buf = zp_rx_buf(ctx);
 
             if (!buf || avail == 0) {
                 vTaskDelay(pdMS_TO_TICKS(5));
@@ -116,32 +115,16 @@ static void zp_rx_task(void* pvParameters) {
                 break;
             }
 
-            zp_rx_commit((size_t)len);
+            zp_rx_commit(ctx, (size_t)len);
         }
 
-        esp_transport_close();
+        close(s_sock);
         vTaskDelay(pdMS_TO_TICKS(CONFIG_ZP_RECONNECT_DELAY_MS));
     }
 }
 
-static int esp_transport_start(void) {
+void esp_zp_start_task(zp_ctx_t* ctx) {
     xTaskCreateStatic(
-        zp_rx_task,
-        "zp_rx",
-        CONFIG_ZP_STACK_SIZE,
-        NULL,
-        5,
-        s_rx_stack,
-        &s_rx_tcb
+        zp_rx_task, "zp_rx", CONFIG_ZP_STACK_SIZE, ctx, 5, s_rx_stack, &s_rx_tcb
     );
-    return 0;
 }
-
-static const zp_transport_t s_esp_transport = {
-    .start = esp_transport_start,
-    .writev = esp_transport_writev,
-    .recv = esp_transport_recv,
-    .close = esp_transport_close,
-};
-
-const zp_transport_t* zp_transport = &s_esp_transport;

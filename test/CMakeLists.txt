@@ -1,5 +1,6 @@
-idf_component_register(
-  SRC_DIRS "."
-  INCLUDE_DIRS "."
-  REQUIRES unity zeropack
-)
+cmake_minimum_required(VERSION 3.16)
+list(APPEND EXTRA_COMPONENT_DIRS "..")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+idf_build_set_property(MINIMAL_BUILD ON)
+
+project(test_zeropack)

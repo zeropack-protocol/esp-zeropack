@@ -1,0 +1,10 @@
+Language: C
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 80
+SortIncludes: true
+
+AlignAfterOpenBracket: BlockIndent
+BinPackArguments: false
+BinPackParameters: false
+
