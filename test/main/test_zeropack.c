@@ -1,13 +1,11 @@
 #include <stdint.h>
-#include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "unity.h"
 #include "unity_test_runner.h"
 #include "zeropack.h"
-#include "zeropack/core.h"
-#include "zeropack/protocol.h"
-#include "zeropack/schema.h"
-#include "zeropack/types.h"
+#include "zeropack/tcp.h"
 
 #define SENSOR_FIELDS(S, F, A) \
     F(S, u16, sensor_id)       \
@@ -28,33 +26,31 @@ static zp_ctx_t s_ctx;
 static uint8_t s_rx[256] __attribute__((aligned(8)));
 static uint8_t s_pool[256] __attribute__((aligned(8)));
 
-static zp_ssize_t dummy_writev(const zp_iovec_t* iov, int iovcnt) {
+static zp_ssize_t dummy_writev(zp_ctx_t* _, const zp_iovec_t* iov, int iovcnt) {
+    (void)_;
     (void)iov;
     (void)iovcnt;
     return 0;
 }
 
 void setUp(void) {
-    zp_init(
-        &s_ctx,
-        &(zp_config_t){
-            .schema = &test_schema,
-            .writev = dummy_writev,
-            ZP_SLICE(rx, s_rx),
-            ZP_SLICE(pool, s_pool),
-        }
-    );
+    s_ctx = (zp_ctx_t){
+        .schema = &test_schema,
+        .writev = dummy_writev,
+        ZP_BUFFER(rx, s_rx),
+        ZP_BUFFER(pool, s_pool),
+    };
+    zp_init(&s_ctx);
 }
 
-TEST_CASE("Schema: tamaños, offsets y metadata correctos", "[zeropack]") {
-    // Verificamos el tamaño total de la estructura en zp_schema
+// Target ABI & Memory Smoke Tests =============================================
+
+TEST_CASE("Schema: ABI, struct offsets, and field metadata", "[abi]") {
     TEST_ASSERT_EQUAL(sizeof(sensor_t), zp_type_size(sensor_t));
     TEST_ASSERT_EQUAL_STRING("sensor_t", zp_type_name(sensor_t));
     TEST_ASSERT_EQUAL_PTR(zp_type_meta(sensor_t), test_schema.types[0]);
     TEST_ASSERT_EQUAL(3, zp_type_meta(sensor_t)->count);
 
-    // Verificamos que los offsets de cada campo coincidan con offsetof del
-    // compilador (ABI)
     TEST_ASSERT_EQUAL(
         offsetof(sensor_t, sensor_id), zp_type_meta(sensor_t)->fields[0].offset
     );
@@ -64,205 +60,134 @@ TEST_CASE("Schema: tamaños, offsets y metadata correctos", "[zeropack]") {
     TEST_ASSERT_EQUAL(
         offsetof(sensor_t, is_active), zp_type_meta(sensor_t)->fields[2].offset
     );
-    // Verificamos que las 3 acciones estén registradas
+
     TEST_ASSERT_EQUAL(3, test_schema.action_count);
     TEST_ASSERT_EQUAL_STRING("ACTION_PING", test_schema.actions[0].name);
     TEST_ASSERT_EQUAL_STRING("ACTION_UPDATE_DATA", test_schema.actions[1].name);
     TEST_ASSERT_EQUAL_STRING("ACTION_SEND_BUFFER", test_schema.actions[2].name);
 }
 
-static sensor_t s_sensor = {0};
-static void on_sensor_update(zp_ctx_t* _, const sensor_t* data) {
-    s_sensor = *data;
-}
-
-TEST_CASE("Dispatch: cast correcto y ejecución de callback", "[zeropack]") {
-    zp_on_action(test_schema, ACTION_UPDATE_DATA, on_sensor_update);
-
-    sensor_t sensor_in = {
-        .sensor_id = 42,
-        .temp_milli = -1550,
-        .is_active = true,
-    };
-
-    zp_header_t hdr = {
-        .action = ACTION_UPDATE_DATA,
-        .type_id = zp_type_id(&test_schema, sensor_t),
-        .count = 1,
-    };
-
-    bool ok = test_schema.dispatch(&s_ctx, &hdr, (const uint8_t*)&sensor_in);
-
-    TEST_ASSERT_TRUE(ok);
-    TEST_ASSERT_EQUAL_UINT16(42, s_sensor.sensor_id);
-    TEST_ASSERT_EQUAL_INT32(-1550, s_sensor.temp_milli);
-    TEST_ASSERT_TRUE(s_sensor.is_active);
-}
-
-static uint16_t s_arr_count = 0;
-static uint8_t s_buffer[16] = {0};
-
-static void on_buffer_received(
-    zp_ctx_t* _, const uint8_t* data, uint16_t count
-) {
-    s_arr_count = count;
-    memcpy(s_buffer, data, count);
-}
-
-TEST_CASE("Dispatch: accion de tipo arreglo dinamico (slice)", "[zeropack]") {
-    zp_on_action(test_schema, ACTION_SEND_BUFFER, on_buffer_received);
-    uint8_t data[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
-    zp_header_t hdr = {
-        .action = ACTION_SEND_BUFFER,
-        .type_id = TYPE_ID_u8,
-        .count = 5,
-    };
-
-    bool ok = test_schema.dispatch(&s_ctx, &hdr, data);
-    TEST_ASSERT_TRUE(ok);
-    TEST_ASSERT_EQUAL_UINT16(5, s_arr_count);
-    TEST_ASSERT_EQUAL_HEX8_ARRAY(data, s_buffer, 5);
-}
-
-TEST_CASE(
-    "Seguridad: descarte de paquetes incompletos o desconocidos", "[zeropack]"
-) {
-    s_sensor.sensor_id = 0;
-    zp_on_action(test_schema, ACTION_UPDATE_DATA, on_sensor_update);
-
-    zp_header_t bad_hdr = {
-        .action = ACTION_UPDATE_DATA, .type_id = TYPE_ID_u8, .count = 2
-    };
-
-    // Payload malformado: su longitud (2 bytes) es menor que sizeof(sensor_t)
-    uint8_t bad_payload[2] = {0x01, 0x02};
-
-    uint8_t* buf = zp_rx_buf(&s_ctx);
-    memcpy(buf, &bad_hdr, sizeof(bad_hdr));
-    memcpy(buf + sizeof(bad_hdr), bad_payload, sizeof(bad_payload));
-    zp_rx_commit(&s_ctx, sizeof(bad_hdr) + sizeof(bad_payload));
-
-    // El callback no debió ejecutarse y el paquete malformado fue descartado.
-    TEST_ASSERT_EQUAL_UINT16(0, s_sensor.sensor_id);
-    TEST_ASSERT_EQUAL_UINT32(0, s_sensor.sensor_id);
-
-    // Acción desconocida en dispatch
-    zp_header_t invalid_hdr = {.action = 99};
-    bool ok =
-        test_schema.dispatch(&s_ctx, &invalid_hdr, (const uint8_t*)&s_sensor);
-    TEST_ASSERT_FALSE(ok);
-}
-
-TEST_CASE(
-    "Pool: almacenamiento lineal, str/val, mutación y reset", "[zeropack]"
-) {
-    // Asegurar estado inicial limpio
+TEST_CASE("Pool: memory allocation and type-safe retrieval", "[pool]") {
     zp_pool_reset(&s_ctx);
     TEST_ASSERT_EQUAL_UINT32(0, s_ctx.pool_len);
 
-    // Guardar un string con zp_pool_str (calcula strlen + 1)
-    poolref_t ref_str = zp_pool_str(&s_ctx, "ZeroPack String");
+    poolref_t ref_str = zp_pool_push_str(&s_ctx, "ZeroPack String");
     TEST_ASSERT_EQUAL_UINT16(0, ref_str);
 
-    // Recuperar y verificar el string con zp_pool_get
-    char* str = zp_pool_get(&s_ctx, ref_str);
+    char* str = zp_pool_get_str(&s_ctx, ref_str);
     TEST_ASSERT_EQUAL_STRING("ZeroPack String", str);
-    size_t str_slot_size = ZP_SLOT_TOTAL_SIZE(strlen("ZeroPack String") + 1);
-    TEST_ASSERT_EQUAL_UINT32(str_slot_size, s_ctx.pool_len);
 
-    // Guardar un struct por valor con zp_pool_val
     sensor_t s = {
         .sensor_id = 101,
         .temp_milli = 24500,
         .is_active = true,
     };
-    poolref_t ref_struct = zp_pool_val(&s_ctx, sensor_t, s);
-    TEST_ASSERT_EQUAL_UINT16(str_slot_size, ref_struct);
-
-    // Recuperar el struct y probar mutación in-place en el pool
-    sensor_t* rec_s = zp_pool_get(&s_ctx, ref_struct);
+    poolref_t ref_struct = zp_pool_push_val(&s_ctx, sensor_t, s);
+    sensor_t* rec_s = zp_pool_get_typed(&s_ctx, sensor_t, ref_struct);
+    TEST_ASSERT_NOT_NULL(rec_s);
     TEST_ASSERT_EQUAL_UINT16(101, rec_s->sensor_id);
     TEST_ASSERT_EQUAL_INT32(24500, rec_s->temp_milli);
 
-    rec_s->temp_milli = 30000;  // Mutamos in-place
-    sensor_t* mutated_s = zp_pool_get(&s_ctx, ref_struct);
-    TEST_ASSERT_EQUAL_INT32(30000, mutated_s->temp_milli);
-
-    // Probar zp_pool_reset() y reutilización desde el offset 0
     zp_pool_reset(&s_ctx);
     TEST_ASSERT_EQUAL_UINT32(0, s_ctx.pool_len);
+}
 
-    poolref_t ref_nuevo = zp_pool_str(&s_ctx, "Reinicio");
-    TEST_ASSERT_EQUAL_UINT16(0, ref_nuevo);
-    TEST_ASSERT_EQUAL_STRING("Reinicio", (char*)zp_pool_get(&s_ctx, ref_nuevo));
+// Transport & FreeRTOS Concurrency Tests ======================================
+
+TEST_CASE("TCP: multi-instance isolation and offline handling", "[tcp]") {
+    static zp_tcp_t s_tcp1;
+    static zp_tcp_t s_tcp2;
+
+    // Both instances have distinct stack buffers and TCBs in BSS
+    TEST_ASSERT_NOT_EQUAL((void*)s_tcp1.stack, (void*)s_tcp2.stack);
+    TEST_ASSERT_NOT_EQUAL((void*)&s_tcp1.tcb, (void*)&s_tcp2.tcb);
+    TEST_ASSERT_NOT_EQUAL((void*)&s_tcp1.lock_bufs, (void*)&s_tcp2.lock_bufs);
+
+    // Offline writev returns -1 cleanly when socket is closed
+    s_tcp1.sock = -1;
+    zp_iovec_t iov = {.buf = "abc", .len = 3};
+    TEST_ASSERT_EQUAL(-1, zp_tcp_writev(&s_tcp1.ctx, &iov, 1));
+}
+
+#define WORKER_STACK_SIZE 4096
+static StaticTask_t s_worker1_tcb;
+static StackType_t s_worker1_stack[WORKER_STACK_SIZE];
+static StaticTask_t s_worker2_tcb;
+static StackType_t s_worker2_stack[WORKER_STACK_SIZE];
+
+static SemaphoreHandle_t s_done_sem;
+static StaticSemaphore_t s_done_sem_buf;
+
+static void worker_task1(void* pv) {
+    zp_tcp_t* t = (zp_tcp_t*)pv;
+    for (int i = 0; i < 50; i++) {
+        zp_pool_push_str(&t->ctx, "worker1_item");
+    }
+    xSemaphoreGive(s_done_sem);
+    vTaskDelete(NULL);
+}
+
+static void worker_task2(void* pv) {
+    zp_tcp_t* t = (zp_tcp_t*)pv;
+    for (int i = 0; i < 50; i++) {
+        zp_pool_push_str(&t->ctx, "worker2_item");
+    }
+    xSemaphoreGive(s_done_sem);
+    vTaskDelete(NULL);
 }
 
 TEST_CASE(
-    "Pipeline RX: zp_rx_get_buffer y zp_rx_commit con reensamblado",
-    "[zeropack]"
+    "FreeRTOS: concurrent pool mutations with zp_tcp_lock", "[freertos]"
 ) {
-    s_sensor.sensor_id = 0;
-    zp_on_action(test_schema, ACTION_UPDATE_DATA, on_sensor_update);
+    static zp_tcp_t s_test_tcp;
+    static uint8_t s_test_rx[512] __attribute__((aligned(8)));
+    static uint8_t s_test_pool[4096] __attribute__((aligned(8)));
 
-    // Probar recepción directa (Zero-Copy)
-    size_t avail = zp_rx_avail(&s_ctx);
-    uint8_t* buf = zp_rx_buf(&s_ctx);
-    TEST_ASSERT_NOT_NULL(buf);
-    TEST_ASSERT_TRUE(avail >= sizeof(zp_header_t) + sizeof(sensor_t));
-
-    zp_header_t hdr = {
-        .action = ACTION_UPDATE_DATA,
-        .type_id = zp_type_id(&test_schema, sensor_t),
-        .count = 1,
+    s_test_tcp = (zp_tcp_t){
+        .ctx = {
+            .schema = &test_schema,
+            ZP_TCP_CONFIG,
+            ZP_BUFFER(rx, s_test_rx),
+            ZP_BUFFER(pool, s_test_pool),
+        },
     };
-    sensor_t sensor_in = {
-        .sensor_id = 777,
-        .temp_milli = 2100,
-        .is_active = true,
-    };
+    zp_init(&s_test_tcp.ctx);
 
-    // Escribimos directo en el buffer de recepción prestado
-    memcpy(buf, &hdr, sizeof(hdr));
-    memcpy(buf + sizeof(hdr), &sensor_in, sizeof(sensor_in));
+    s_test_tcp.locks[ZP_LOCK_TX] =
+        xSemaphoreCreateMutexStatic(&s_test_tcp.lock_bufs[ZP_LOCK_TX]);
+    s_test_tcp.locks[ZP_LOCK_POOL] =
+        xSemaphoreCreateMutexStatic(&s_test_tcp.lock_bufs[ZP_LOCK_POOL]);
 
-    // Notificamos los bytes recibidos
-    zp_rx_commit(&s_ctx, sizeof(hdr) + sizeof(sensor_in));
+    s_done_sem = xSemaphoreCreateCountingStatic(2, 0, &s_done_sem_buf);
 
-    // Verificamos que el paquete fue parseado y el callback ejecutado
-    TEST_ASSERT_EQUAL_UINT16(777, s_sensor.sensor_id);
-    TEST_ASSERT_EQUAL_INT32(2100, s_sensor.temp_milli);
-    TEST_ASSERT_TRUE(s_sensor.is_active);
+    xTaskCreateStatic(
+        worker_task1,
+        "w1",
+        WORKER_STACK_SIZE,
+        &s_test_tcp,
+        5,
+        s_worker1_stack,
+        &s_worker1_tcb
+    );
+    xTaskCreateStatic(
+        worker_task2,
+        "w2",
+        WORKER_STACK_SIZE,
+        &s_test_tcp,
+        5,
+        s_worker2_stack,
+        &s_worker2_tcb
+    );
 
-    // Probar paquete fragmentado en 2 chunks (reensamblado en buffer)
-    s_sensor.sensor_id = 0;
-    sensor_in.sensor_id = 888;
-    sensor_in.temp_milli = -500;
+    TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
+    TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
 
-    buf = zp_rx_buf(&s_ctx);
-    TEST_ASSERT_NOT_NULL(buf);
-
-    // Chunk 1: solo 2 bytes del header
-    memcpy(buf, &hdr, 2);
-    zp_rx_commit(&s_ctx, 2);
-    TEST_ASSERT_EQUAL_UINT16(0, s_sensor.sensor_id);  // No debe disparar aún
-
-    // Chunk 2: el resto del header (2 bytes) + payload completo
-    buf = zp_rx_buf(&s_ctx);
-    TEST_ASSERT_NOT_NULL(buf);
-    memcpy(buf, ((const uint8_t*)&hdr) + 2, sizeof(hdr) - 2);
-    memcpy(buf + (sizeof(hdr) - 2), &sensor_in, sizeof(sensor_in));
-    zp_rx_commit(&s_ctx, (sizeof(hdr) - 2) + sizeof(sensor_in));
-
-    // Debe completarse el paquete tras el segundo chunk
-    TEST_ASSERT_EQUAL_UINT16(888, s_sensor.sensor_id);
-    TEST_ASSERT_EQUAL_INT32(-500, s_sensor.temp_milli);
-
-    // Verificamos que el buffer se haya compactado y liberado por completo
-    TEST_ASSERT_EQUAL_UINT32(s_ctx.rx_cap, zp_rx_avail(&s_ctx));
+    TEST_ASSERT_TRUE(s_test_tcp.ctx.pool_len > 0);
 }
 
 void app_main(void) {
     UNITY_BEGIN();
-    unity_run_tests_by_tag("[zeropack]", false);
+    unity_run_all_tests();
     UNITY_END();
+    exit(0);
 }

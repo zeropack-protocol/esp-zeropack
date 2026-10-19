@@ -18,16 +18,29 @@ ESP-IDF component providing FreeRTOS platform support and transports for the [Ze
 
 ## Features
 
-- **FreeRTOS Integration:** Static mutexes (`xSemaphoreCreateMutexStatic`) for ZeroPack TX and pool synchronization.
-- **TCP Socket Worker:** Background FreeRTOS task handling TCP connection, reconnection, and packet dispatching.
+- **Zero Global State & Multi-Instance:** Every `zp_tcp_t` embeds its own dedicated `StaticTask_t`, task stack, and `StaticSemaphore_t` mutexes. Run multiple connections with zero memory or lock contention.
+- **Zero Dynamic Heap Allocation:** All task and synchronization memory is statically allocated in BSS.
+- **In-Place Initialization:** Initializes directly via `zp_init(&s_zp.ctx)` using C designated initializers.
 - **Submodule Core:** Directly pulls the canonical, freestanding [ZeroPack C11 core](https://github.com/zeropack-protocol/zeropack).
-- **Kconfig Configurable:** Configure server IP, port, reconnect timeouts, and buffer sizes directly via `idf.py menuconfig`.
+- **Kconfig Tunable:** Task stack size configurable via `idf.py menuconfig`.
 
 ---
 
 ## Installation
 
-Add this repository as a submodule into your ESP-IDF project's `components/` directory:
+### Option 1: ESP-IDF Component Manager (Recommended)
+
+Add `esp-zeropack` to your project's `main/idf_component.yml`:
+
+```yaml
+dependencies:
+  esp-zeropack:
+    git: https://github.com/zeropack-protocol/esp-zeropack.git
+```
+
+### Option 2: Git Submodule
+
+Clone directly into your project's `components/` directory:
 
 ```bash
 git submodule add --recursive https://github.com/zeropack-protocol/esp-zeropack.git components/esp-zeropack
@@ -42,13 +55,10 @@ Run `idf.py menuconfig` and navigate to:
 ```text
 Component config --->
     ZeroPack Configuration --->
-        (192.168.1.100) Server IP address
-        (8080)          Server TCP port
-        (1024)          Receive buffer size (bytes)
-        (4096)          RX task stack size (bytes)
-        (1024)          Static memory pool size (bytes)
-        (1500)          Reconnection retry delay (ms)
+        (4096) RX task stack size (bytes)
 ```
+
+Host address, port, and reconnection timing can be configured per-instance directly on `zp_tcp_t`.
 
 ---
 
@@ -57,8 +67,8 @@ Component config --->
 In your application code (e.g., `main/app_main.c`):
 
 ```c
-#include "zeropack.h"
 #include "esp_log.h"
+#include "zeropack/tcp.h"
 
 // 1. Declare application schema (structs & actions)
 #define APP_TYPES(X) \
@@ -73,26 +83,47 @@ In your application code (e.g., `main/app_main.c`):
     T(ACTION_TELEMETRY, Telemetry)
 
 ZP_DECLARE(APP_TYPES, APP_ACTIONS)
-ZP_GENERATE_SCHEMA(APP_TYPES, APP_ACTIONS)
+ZP_GENERATE_SCHEMA(app_schema, APP_TYPES, APP_ACTIONS)
+
+static zp_tcp_t s_zp;
+static uint8_t s_rx[1024] __attribute__((aligned(8)));
+static uint8_t s_pool[1024] __attribute__((aligned(8)));
 
 // 2. Action callback
-static void on_ping(void) {
+static void on_ping(zp_ctx_t* ctx) {
+    (void)ctx;
     ESP_LOGI("APP", "Received ACTION_PING from server");
 }
 
 void app_main(void) {
     // Register action callbacks
-    zp_on_action(ACTION_PING, on_ping);
+    ZP_SUBSCRIBE(app_schema, ACTION_PING, on_ping);
 
-    // Starts the background TCP RX worker and connects to backend
-    zp_start();
+    // Initialize ZeroPack TCP transport instance
+    s_zp = (zp_tcp_t){
+        .ctx = {
+            .schema = &app_schema,
+            ZP_TCP_CONFIG,
+            ZP_BUFFER(rx, s_rx),
+            ZP_BUFFER(pool, s_pool),
+        },
+        .host = "192.168.1.100",
+        .port = 8080,
+        .reconnect_ms = 1500,
+    };
 
-    // Emit events over WiFi
+    // Validate context, align buffers, and activate runtime state
+    zp_init(&s_zp.ctx);
+
+    // Start background FreeRTOS TCP worker task
+    zp_tcp_start(&s_zp);
+
+    // Emit events over WiFi / Ethernet
     Telemetry report = {
         .temperature = 25.4f,
         .uptime_ms = 1000,
     };
-    zp_emit(ACTION_TELEMETRY, &report);
+    zp_emit(&s_zp.ctx, ACTION_TELEMETRY, &report);
 }
 ```
 

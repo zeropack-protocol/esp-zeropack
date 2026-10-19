@@ -6,5 +6,5 @@ idf_component_register(
     "include"
     "lib/zeropack/include"
   REQUIRES
-    lwip esp_netif freertos
+    lwip freertos
 )
