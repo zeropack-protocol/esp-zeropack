@@ -26,8 +26,10 @@ static zp_ctx_t s_ctx;
 static uint8_t s_rx[256] __attribute__((aligned(8)));
 static uint8_t s_pool[256] __attribute__((aligned(8)));
 
-static zp_ssize_t dummy_writev(zp_ctx_t* _, const zp_iovec_t* iov, int iovcnt) {
-    (void)_;
+static zp_ssize_t dummy_writev(
+    zp_ctx_t* ctx, const zp_iovec_t* iov, int iovcnt
+) {
+    (void)ctx;
     (void)iov;
     (void)iovcnt;
     return 0;
@@ -105,8 +107,9 @@ TEST_CASE("TCP: multi-instance isolation and offline handling", "[tcp]") {
 
     // Offline writev returns -1 cleanly when socket is closed
     s_tcp1.sock = -1;
+    zp_ctx_t ctx1 = {.transport = &s_tcp1};
     zp_iovec_t iov = {.buf = "abc", .len = 3};
-    TEST_ASSERT_EQUAL(-1, zp_tcp_writev(&s_tcp1.ctx, &iov, 1));
+    TEST_ASSERT_EQUAL(-1, zp_tcp_writev(&ctx1, &iov, 1));
 }
 
 #define WORKER_STACK_SIZE 4096
@@ -119,18 +122,18 @@ static SemaphoreHandle_t s_done_sem;
 static StaticSemaphore_t s_done_sem_buf;
 
 static void worker_task1(void* pv) {
-    zp_tcp_t* t = (zp_tcp_t*)pv;
+    zp_ctx_t* ctx = (zp_ctx_t*)pv;
     for (int i = 0; i < 50; i++) {
-        zp_pool_push_str(&t->ctx, "worker1_item");
+        zp_pool_push_str(ctx, "worker1_item");
     }
     xSemaphoreGive(s_done_sem);
     vTaskDelete(NULL);
 }
 
 static void worker_task2(void* pv) {
-    zp_tcp_t* t = (zp_tcp_t*)pv;
+    zp_ctx_t* ctx = (zp_ctx_t*)pv;
     for (int i = 0; i < 50; i++) {
-        zp_pool_push_str(&t->ctx, "worker2_item");
+        zp_pool_push_str(ctx, "worker2_item");
     }
     xSemaphoreGive(s_done_sem);
     vTaskDelete(NULL);
@@ -140,23 +143,26 @@ TEST_CASE(
     "FreeRTOS: concurrent pool mutations with zp_tcp_lock", "[freertos]"
 ) {
     static zp_tcp_t s_test_tcp;
+    static zp_ctx_t s_test_ctx;
     static uint8_t s_test_rx[512] __attribute__((aligned(8)));
     static uint8_t s_test_pool[4096] __attribute__((aligned(8)));
 
-    s_test_tcp = (zp_tcp_t){
-        .ctx = {
-            .schema = &test_schema,
-            ZP_TCP_CONFIG,
-            ZP_BUFFER(rx, s_test_rx),
-            ZP_BUFFER(pool, s_test_pool),
-        },
-    };
-    zp_init(&s_test_tcp.ctx);
-
+    s_test_tcp = (zp_tcp_t){0};
     s_test_tcp.locks[ZP_LOCK_TX] =
         xSemaphoreCreateMutexStatic(&s_test_tcp.lock_bufs[ZP_LOCK_TX]);
     s_test_tcp.locks[ZP_LOCK_POOL] =
         xSemaphoreCreateMutexStatic(&s_test_tcp.lock_bufs[ZP_LOCK_POOL]);
+
+    s_test_ctx = (zp_ctx_t){
+        .schema = &test_schema,
+        .transport = &s_test_tcp,
+        .lock = zp_tcp_lock,
+        .unlock = zp_tcp_unlock,
+        .writev = zp_tcp_writev,
+        ZP_BUFFER(rx, s_test_rx),
+        ZP_BUFFER(pool, s_test_pool),
+    };
+    TEST_ASSERT_NOT_NULL(zp_init(&s_test_ctx));
 
     s_done_sem = xSemaphoreCreateCountingStatic(2, 0, &s_done_sem_buf);
 
@@ -164,7 +170,7 @@ TEST_CASE(
         worker_task1,
         "w1",
         WORKER_STACK_SIZE,
-        &s_test_tcp,
+        &s_test_ctx,
         5,
         s_worker1_stack,
         &s_worker1_tcb
@@ -173,7 +179,7 @@ TEST_CASE(
         worker_task2,
         "w2",
         WORKER_STACK_SIZE,
-        &s_test_tcp,
+        &s_test_ctx,
         5,
         s_worker2_stack,
         &s_worker2_tcb
@@ -182,7 +188,7 @@ TEST_CASE(
     TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
     TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
 
-    TEST_ASSERT_TRUE(s_test_tcp.ctx.pool_len > 0);
+    TEST_ASSERT_TRUE(s_test_ctx.pool_len > 0);
 }
 
 void app_main(void) {
