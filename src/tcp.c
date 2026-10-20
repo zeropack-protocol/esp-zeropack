@@ -78,7 +78,7 @@ static void zp_tcp_task(void* pvParameters) {
                 break;
             }
 
-            zp_rx_commit(ctx, (size_t)len);
+            ctx->rx_head += len;
         }
 
         int old_sock = tcp->sock;
