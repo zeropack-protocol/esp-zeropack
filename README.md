@@ -18,7 +18,7 @@ ESP-IDF component providing FreeRTOS platform support and transports for the [Ze
 
 ## Features
 
-- **Zero Global State & Multi-Instance:** Every `zp_tcp_t` embeds its own dedicated `StaticTask_t`, task stack, and `StaticSemaphore_t` mutexes. Run multiple connections with zero memory or lock contention.
+- **Zero Global State & Multi-Instance:** Every `zp_tcp_t` embeds its own dedicated `StaticTask_t`, task stack, and `StaticSemaphore_t` write mutex. Run multiple connections with zero memory contention.
 - **Zero Dynamic Heap Allocation:** All task and synchronization memory is statically allocated in BSS.
 - **In-Place Initialization:** Initializes directly via `zp_init(&s_zp.ctx)` using C designated initializers.
 - **Submodule Core:** Directly pulls the canonical, freestanding [ZeroPack C11 core](https://github.com/zeropack-protocol/zeropack).
@@ -89,41 +89,50 @@ static zp_tcp_t s_zp;
 static uint8_t s_rx[1024] __attribute__((aligned(8)));
 static uint8_t s_pool[1024] __attribute__((aligned(8)));
 
-// 2. Action callback
-static void on_ping(zp_ctx_t* ctx) {
-    (void)ctx;
-    ESP_LOGI("APP", "Received ACTION_PING from server");
-}
-
 void app_main(void) {
-    // Register action callbacks
-    ZP_SUBSCRIBE(app_schema, ACTION_PING, on_ping);
+    zp_ctx_t ctx = {
+        .schema = &app_schema,
+        ZP_BUFFER(rx, s_rx),
+        ZP_BUFFER(pool, s_pool),
+    };
 
-    // Initialize ZeroPack TCP transport instance
-    s_zp = (zp_tcp_t){
-        .ctx = {
-            .schema = &app_schema,
-            ZP_TCP_CONFIG,
-            ZP_BUFFER(rx, s_rx),
-            ZP_BUFFER(pool, s_pool),
-        },
+    zp_tcp_t tcp = {
         .host = "192.168.1.100",
         .port = 8080,
         .reconnect_ms = 1500,
     };
 
-    // Validate context, align buffers, and activate runtime state
-    zp_init(&s_zp.ctx);
-
-    // Start background FreeRTOS TCP worker task
-    zp_tcp_start(&s_zp);
+    // Initialize ZeroPack context and start background worker task
+    zp_tcp_start(&ctx, &tcp);
 
     // Emit events over WiFi / Ethernet
     Telemetry report = {
         .temperature = 25.4f,
         .uptime_ms = 1000,
     };
-    zp_emit(&s_zp.ctx, ACTION_TELEMETRY, &report);
+    zp_emit(&ctx, ACTION_TELEMETRY, &report);
+
+    // Process incoming events with non-blocking zp_poll & FreeRTOS task notifications
+    zp_msg_t msg;
+    while (1) {
+        while (zp_poll(&ctx, &msg)) {
+            switch (msg.action) {
+            case ACTION_PING:
+                ESP_LOGI("APP", "Received ACTION_PING from server");
+                break;
+            default:
+                break;
+            }
+        }
+
+        // Wake tcp_task if it was waiting for buffer space
+        if (tcp.tcp_task) {
+            xTaskNotifyGive(tcp.tcp_task);
+        }
+
+        // Sleep with 0% CPU until tcp_task notifies us of new incoming bytes
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
 }
 ```
 

@@ -103,7 +103,6 @@ TEST_CASE("TCP: multi-instance isolation and offline handling", "[tcp]") {
     // Both instances have distinct stack buffers and TCBs in BSS
     TEST_ASSERT_NOT_EQUAL((void*)s_tcp1.stack, (void*)s_tcp2.stack);
     TEST_ASSERT_NOT_EQUAL((void*)&s_tcp1.tcb, (void*)&s_tcp2.tcb);
-    TEST_ASSERT_NOT_EQUAL((void*)&s_tcp1.lock_bufs, (void*)&s_tcp2.lock_bufs);
 
     // Offline writev returns -1 cleanly when socket is closed
     s_tcp1.sock = -1;
@@ -111,6 +110,9 @@ TEST_CASE("TCP: multi-instance isolation and offline handling", "[tcp]") {
     zp_iovec_t iov = {.buf = "abc", .len = 3};
     TEST_ASSERT_EQUAL(-1, zp_tcp_writev(&ctx1, &iov, 1));
 }
+
+#include <string.h>
+#include <unistd.h>
 
 #define WORKER_STACK_SIZE 4096
 static StaticTask_t s_worker1_tcb;
@@ -120,45 +122,43 @@ static StackType_t s_worker2_stack[WORKER_STACK_SIZE];
 
 static SemaphoreHandle_t s_done_sem;
 static StaticSemaphore_t s_done_sem_buf;
+static SemaphoreHandle_t s_pool_lock;
+static StaticSemaphore_t s_pool_lock_buf;
 
-static void worker_task1(void* pv) {
+static void worker_pool_task1(void* pv) {
     zp_ctx_t* ctx = (zp_ctx_t*)pv;
     for (int i = 0; i < 50; i++) {
+        xSemaphoreTake(s_pool_lock, portMAX_DELAY);
         zp_pool_push_str(ctx, "worker1_item");
+        xSemaphoreGive(s_pool_lock);
     }
     xSemaphoreGive(s_done_sem);
     vTaskDelete(NULL);
 }
 
-static void worker_task2(void* pv) {
+static void worker_pool_task2(void* pv) {
     zp_ctx_t* ctx = (zp_ctx_t*)pv;
     for (int i = 0; i < 50; i++) {
+        xSemaphoreTake(s_pool_lock, portMAX_DELAY);
         zp_pool_push_str(ctx, "worker2_item");
+        xSemaphoreGive(s_pool_lock);
     }
     xSemaphoreGive(s_done_sem);
     vTaskDelete(NULL);
 }
 
 TEST_CASE(
-    "FreeRTOS: concurrent pool mutations with zp_tcp_lock", "[freertos]"
+    "FreeRTOS: concurrent pool mutations with transactional mutex", "[freertos]"
 ) {
-    static zp_tcp_t s_test_tcp;
     static zp_ctx_t s_test_ctx;
     static uint8_t s_test_rx[512] __attribute__((aligned(8)));
     static uint8_t s_test_pool[4096] __attribute__((aligned(8)));
 
-    s_test_tcp = (zp_tcp_t){0};
-    s_test_tcp.locks[ZP_LOCK_TX] =
-        xSemaphoreCreateMutexStatic(&s_test_tcp.lock_bufs[ZP_LOCK_TX]);
-    s_test_tcp.locks[ZP_LOCK_POOL] =
-        xSemaphoreCreateMutexStatic(&s_test_tcp.lock_bufs[ZP_LOCK_POOL]);
+    s_pool_lock = xSemaphoreCreateMutexStatic(&s_pool_lock_buf);
 
     s_test_ctx = (zp_ctx_t){
         .schema = &test_schema,
-        .transport = &s_test_tcp,
-        .lock = zp_tcp_lock,
-        .unlock = zp_tcp_unlock,
-        .writev = zp_tcp_writev,
+        .writev = dummy_writev,
         ZP_BUFFER(rx, s_test_rx),
         ZP_BUFFER(pool, s_test_pool),
     };
@@ -167,7 +167,7 @@ TEST_CASE(
     s_done_sem = xSemaphoreCreateCountingStatic(2, 0, &s_done_sem_buf);
 
     xTaskCreateStatic(
-        worker_task1,
+        worker_pool_task1,
         "w1",
         WORKER_STACK_SIZE,
         &s_test_ctx,
@@ -176,7 +176,7 @@ TEST_CASE(
         &s_worker1_tcb
     );
     xTaskCreateStatic(
-        worker_task2,
+        worker_pool_task2,
         "w2",
         WORKER_STACK_SIZE,
         &s_test_ctx,
@@ -189,6 +189,186 @@ TEST_CASE(
     TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
 
     TEST_ASSERT_TRUE(s_test_ctx.pool_len > 0);
+}
+
+static void worker_tx_task1(void* pv) {
+    zp_ctx_t* ctx = (zp_ctx_t*)pv;
+    for (int i = 0; i < 20; i++) {
+        sensor_t s = {
+            .sensor_id = (uint16_t)i,
+            .temp_milli = 20000 + i,
+            .is_active = true,
+        };
+        zp_emit(ctx, ACTION_UPDATE_DATA, &s);
+    }
+    xSemaphoreGive(s_done_sem);
+    vTaskDelete(NULL);
+}
+
+static void worker_tx_task2(void* pv) {
+    zp_ctx_t* ctx = (zp_ctx_t*)pv;
+    for (int i = 0; i < 20; i++) {
+        zp_emit(ctx, ACTION_PING);
+    }
+    xSemaphoreGive(s_done_sem);
+    vTaskDelete(NULL);
+}
+
+TEST_CASE(
+    "FreeRTOS: concurrent writev serialization with writev_lock", "[freertos]"
+) {
+    static zp_tcp_t s_test_tcp;
+    static zp_ctx_t s_test_ctx;
+    static uint8_t s_test_rx[512] __attribute__((aligned(8)));
+    static uint8_t s_test_pool[512] __attribute__((aligned(8)));
+
+    int fds[2];
+    TEST_ASSERT_EQUAL(0, pipe(fds));
+
+    s_test_tcp = (zp_tcp_t){
+        .sock = fds[1],
+    };
+    s_test_tcp.writev_lock =
+        xSemaphoreCreateMutexStatic(&s_test_tcp.writev_lock_buf);
+
+    s_test_ctx = (zp_ctx_t){
+        .schema = &test_schema,
+        .transport = &s_test_tcp,
+        .writev = zp_tcp_writev,
+        ZP_BUFFER(rx, s_test_rx),
+        ZP_BUFFER(pool, s_test_pool),
+    };
+    TEST_ASSERT_NOT_NULL(zp_init(&s_test_ctx));
+
+    s_done_sem = xSemaphoreCreateCountingStatic(2, 0, &s_done_sem_buf);
+
+    xTaskCreateStatic(
+        worker_tx_task1,
+        "tx1",
+        WORKER_STACK_SIZE,
+        &s_test_ctx,
+        5,
+        s_worker1_stack,
+        &s_worker1_tcb
+    );
+    xTaskCreateStatic(
+        worker_tx_task2,
+        "tx2",
+        WORKER_STACK_SIZE,
+        &s_test_ctx,
+        5,
+        s_worker2_stack,
+        &s_worker2_tcb
+    );
+
+    TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
+    TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
+
+    close(fds[1]);
+    close(fds[0]);
+}
+
+TEST_CASE("RX: pull-based zp_poll decoding in FreeRTOS environment", "[rx]") {
+    zp_ctx_t rx_ctx = {
+        .schema = &test_schema,
+        .writev = dummy_writev,
+        ZP_BUFFER(rx, s_rx),
+        ZP_BUFFER(pool, s_pool),
+    };
+    TEST_ASSERT_NOT_NULL(zp_init(&rx_ctx));
+
+    zp_header_t ping_hdr = {
+        .action = 0,
+        .type_id = 0,
+        .count = 0,
+    };
+    memcpy(rx_ctx.rx_buf, &ping_hdr, sizeof(ping_hdr));
+    rx_ctx.rx_head = sizeof(ping_hdr);
+
+    zp_msg_t msg;
+    TEST_ASSERT_TRUE(zp_poll(&rx_ctx, &msg));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.action);
+    TEST_ASSERT_NULL(msg.payload);
+    TEST_ASSERT_FALSE(zp_poll(&rx_ctx, &msg));
+}
+
+static void mock_tcp_worker(void* pv) {
+    zp_ctx_t* ctx = (zp_ctx_t*)pv;
+    zp_tcp_t* tcp = (zp_tcp_t*)ctx->transport;
+
+    // Simulate network delay before bytes arrive
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    zp_header_t hdr = {
+        .action = 0,
+        .type_id = 0,
+        .count = 0,
+    };
+    memcpy(ctx->rx_buf + ctx->rx_head, &hdr, sizeof(hdr));
+    ctx->rx_head += sizeof(hdr);
+
+    // Notify app task that bytes arrived
+    if (tcp->app_task) {
+        xTaskNotifyGive(tcp->app_task);
+    }
+
+    // Wait for app task to acknowledge / drain
+    uint32_t val = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+    TEST_ASSERT_TRUE(val > 0);
+
+    xSemaphoreGive(s_done_sem);
+    vTaskDelete(NULL);
+}
+
+TEST_CASE(
+    "FreeRTOS: bidirectional task notification (tcp_task <-> app_task)",
+    "[freertos]"
+) {
+    static zp_tcp_t mock_tcp;
+    static zp_ctx_t mock_ctx;
+    static uint8_t mock_rx[256] __attribute__((aligned(8)));
+    static uint8_t mock_pool[256] __attribute__((aligned(8)));
+
+    mock_tcp = (zp_tcp_t){
+        .app_task = xTaskGetCurrentTaskHandle(),
+    };
+
+    mock_ctx = (zp_ctx_t){
+        .schema = &test_schema,
+        .transport = &mock_tcp,
+        .writev = dummy_writev,
+        ZP_BUFFER(rx, mock_rx),
+        ZP_BUFFER(pool, mock_pool),
+    };
+    TEST_ASSERT_NOT_NULL(zp_init(&mock_ctx));
+
+    s_done_sem = xSemaphoreCreateCountingStatic(1, 0, &s_done_sem_buf);
+
+    mock_tcp.tcp_task = xTaskCreateStatic(
+        mock_tcp_worker,
+        "mock_tcp",
+        WORKER_STACK_SIZE,
+        &mock_ctx,
+        5,
+        s_worker1_stack,
+        &s_worker1_tcb
+    );
+    TEST_ASSERT_NOT_NULL(mock_tcp.tcp_task);
+
+    // App task sleeps waiting for notification from mock_tcp
+    uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+    TEST_ASSERT_TRUE(notified > 0);
+
+    // Verify packet can now be polled
+    zp_msg_t msg;
+    TEST_ASSERT_TRUE(zp_poll(&mock_ctx, &msg));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.action);
+
+    // Wake mock_tcp back up
+    xTaskNotifyGive(mock_tcp.tcp_task);
+
+    // Wait for worker to finish
+    TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(1000)));
 }
 
 void app_main(void) {

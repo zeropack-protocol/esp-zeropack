@@ -1,6 +1,7 @@
 #include "zeropack/tcp.h"
 
 #include "freertos/idf_additions.h"
+#include "freertos/projdefs.h"
 #include "portmacro.h"
 
 #if __has_include(<lwip/sockets.h>)
@@ -62,7 +63,7 @@ static void zp_tcp_task(void* pvParameters) {
             uint8_t* buf = zp_rx_buf(ctx);
 
             if (!buf || avail == 0) {
-                vTaskDelay(pdMS_TO_TICKS(5));
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
                 continue;
             }
 
@@ -79,6 +80,10 @@ static void zp_tcp_task(void* pvParameters) {
             }
 
             ctx->rx_head += len;
+
+            if (tcp->app_task) {
+                xTaskNotifyGive(tcp->app_task);
+            }
         }
 
         int old_sock = tcp->sock;
@@ -92,49 +97,40 @@ static void zp_tcp_task(void* pvParameters) {
 
 zp_ssize_t zp_tcp_writev(zp_ctx_t* ctx, const zp_iovec_t* iov, int iovcnt) {
     zp_tcp_t* tcp = ctx->transport;
-
     if (!tcp || tcp->sock < 0) return -1;
+
+    xSemaphoreTake(tcp->writev_lock, portMAX_DELAY);
+
+    zp_ssize_t ret;
 #if __has_include(<lwip/sockets.h>)
-    return lwip_writev(tcp->sock, (const struct iovec*)iov, iovcnt);
+    ret = lwip_writev(tcp->sock, (const struct iovec*)iov, iovcnt);
 #else
-    return writev(tcp->sock, (const struct iovec*)iov, iovcnt);
+    ret = writev(tcp->sock, (const struct iovec*)iov, iovcnt);
 #endif
-}
 
-void zp_tcp_lock(zp_ctx_t* ctx, zp_lock_target_t target) {
-    zp_tcp_t* tcp = ctx->transport;
-
-    if (tcp && tcp->locks[target]) {
-        xSemaphoreTake(tcp->locks[target], portMAX_DELAY);
-    }
-}
-
-void zp_tcp_unlock(zp_ctx_t* ctx, zp_lock_target_t target) {
-    zp_tcp_t* tcp = ctx->transport;
-
-    if (tcp && tcp->locks[target]) {
-        xSemaphoreGive(tcp->locks[target]);
-    }
+    xSemaphoreGive(tcp->writev_lock);
+    return ret;
 }
 
 int zp_tcp_start(zp_ctx_t* ctx, zp_tcp_t* transport) {
     if (!ctx || !transport || ctx->transport) return -1;
 
     transport->sock = -1;
-    transport->locks[ZP_LOCK_TX] =
-        xSemaphoreCreateMutexStatic(&transport->lock_bufs[ZP_LOCK_TX]);
-    transport->locks[ZP_LOCK_POOL] =
-        xSemaphoreCreateMutexStatic(&transport->lock_bufs[ZP_LOCK_POOL]);
 
-    ctx->lock = ctx->lock ? ctx->lock : zp_tcp_lock;
-    ctx->unlock = ctx->unlock ? ctx->unlock : zp_tcp_unlock;
+    transport->writev_lock =
+        xSemaphoreCreateMutexStatic(&transport->writev_lock_buf);
+
     ctx->writev = ctx->writev ? ctx->writev : zp_tcp_writev;
 
     if (!zp_init(ctx)) return -1;
 
     ctx->transport = transport;
 
-    transport->task = xTaskCreateStatic(
+    if (!transport->app_task) {
+        transport->app_task = xTaskGetCurrentTaskHandle();
+    }
+
+    transport->tcp_task = xTaskCreateStatic(
         zp_tcp_task,
         "zp_tcp_task",
         CONFIG_ZP_STACK_SIZE,
@@ -144,7 +140,7 @@ int zp_tcp_start(zp_ctx_t* ctx, zp_tcp_t* transport) {
         &transport->tcb
     );
 
-    if (!transport->task) {
+    if (!transport->tcp_task) {
         ctx->transport = NULL;
         return -1;
     };
