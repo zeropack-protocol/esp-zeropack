@@ -20,7 +20,7 @@
     A(ACTION_SEND_BUFFER, u8)
 
 ZP_DECLARE(TEST_TYPES, TEST_ACTIONS)
-ZP_GENERATE_SCHEMA(test_schema, TEST_TYPES, TEST_ACTIONS)
+ZP_SCHEMA(test_schema, TEST_TYPES, TEST_ACTIONS)
 
 static zp_ctx_t s_ctx;
 static uint8_t s_rx[256] __attribute__((aligned(8)));
@@ -39,8 +39,8 @@ void setUp(void) {
     s_ctx = (zp_ctx_t){
         .schema = &test_schema,
         .writev = dummy_writev,
-        ZP_BUFFER(rx, s_rx),
-        ZP_BUFFER(pool, s_pool),
+        .buf = {.data = s_rx, .cap = sizeof(s_rx)},
+        .pool = {.data = s_pool, .cap = sizeof(s_pool)},
     };
     zp_init(&s_ctx);
 }
@@ -48,19 +48,19 @@ void setUp(void) {
 // Target ABI & Memory Smoke Tests =============================================
 
 TEST_CASE("Schema: ABI, struct offsets, and field metadata", "[abi]") {
-    TEST_ASSERT_EQUAL(sizeof(sensor_t), zp_type_size(sensor_t));
-    TEST_ASSERT_EQUAL_STRING("sensor_t", zp_type_name(sensor_t));
-    TEST_ASSERT_EQUAL_PTR(zp_type_meta(sensor_t), test_schema.types[0]);
-    TEST_ASSERT_EQUAL(3, zp_type_meta(sensor_t)->count);
+    TEST_ASSERT_EQUAL(sizeof(sensor_t), zp_metaof(sensor_t)->size);
+    TEST_ASSERT_EQUAL_STRING("sensor_t", zp_metaof(sensor_t)->name);
+    TEST_ASSERT_EQUAL_PTR(zp_metaof(sensor_t), test_schema.types[0]);
+    TEST_ASSERT_EQUAL(3, zp_metaof(sensor_t)->count);
 
     TEST_ASSERT_EQUAL(
-        offsetof(sensor_t, sensor_id), zp_type_meta(sensor_t)->fields[0].offset
+        offsetof(sensor_t, sensor_id), zp_metaof(sensor_t)->fields[0].offset
     );
     TEST_ASSERT_EQUAL(
-        offsetof(sensor_t, temp_milli), zp_type_meta(sensor_t)->fields[1].offset
+        offsetof(sensor_t, temp_milli), zp_metaof(sensor_t)->fields[1].offset
     );
     TEST_ASSERT_EQUAL(
-        offsetof(sensor_t, is_active), zp_type_meta(sensor_t)->fields[2].offset
+        offsetof(sensor_t, is_active), zp_metaof(sensor_t)->fields[2].offset
     );
 
     TEST_ASSERT_EQUAL(3, test_schema.action_count);
@@ -71,7 +71,7 @@ TEST_CASE("Schema: ABI, struct offsets, and field metadata", "[abi]") {
 
 TEST_CASE("Pool: memory allocation and type-safe retrieval", "[pool]") {
     zp_pool_reset(&s_ctx);
-    TEST_ASSERT_EQUAL_UINT32(0, s_ctx.pool_len);
+    TEST_ASSERT_EQUAL_UINT32(0, s_ctx.pool.head);
 
     poolref_t ref_str = zp_pool_push_str(&s_ctx, "ZeroPack String");
     TEST_ASSERT_EQUAL_UINT16(0, ref_str);
@@ -84,14 +84,14 @@ TEST_CASE("Pool: memory allocation and type-safe retrieval", "[pool]") {
         .temp_milli = 24500,
         .is_active = true,
     };
-    poolref_t ref_struct = zp_pool_push_val(&s_ctx, sensor_t, s);
-    sensor_t* rec_s = zp_pool_get_typed(&s_ctx, sensor_t, ref_struct);
+    poolref_t ref_struct = zp_pool_push(&s_ctx, sensor_t, &s, 1);
+    sensor_t* rec_s = zp_pool_get(&s_ctx, sensor_t, ref_struct, NULL);
     TEST_ASSERT_NOT_NULL(rec_s);
     TEST_ASSERT_EQUAL_UINT16(101, rec_s->sensor_id);
     TEST_ASSERT_EQUAL_INT32(24500, rec_s->temp_milli);
 
     zp_pool_reset(&s_ctx);
-    TEST_ASSERT_EQUAL_UINT32(0, s_ctx.pool_len);
+    TEST_ASSERT_EQUAL_UINT32(0, s_ctx.pool.head);
 }
 
 // Transport & FreeRTOS Concurrency Tests ======================================
@@ -159,8 +159,8 @@ TEST_CASE(
     s_test_ctx = (zp_ctx_t){
         .schema = &test_schema,
         .writev = dummy_writev,
-        ZP_BUFFER(rx, s_test_rx),
-        ZP_BUFFER(pool, s_test_pool),
+        .buf = {.data = s_test_rx, .cap = sizeof(s_test_rx)},
+        .pool = {.data = s_test_pool, .cap = sizeof(s_test_pool)},
     };
     TEST_ASSERT_NOT_NULL(zp_init(&s_test_ctx));
 
@@ -188,7 +188,7 @@ TEST_CASE(
     TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
     TEST_ASSERT_TRUE(xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(5000)));
 
-    TEST_ASSERT_TRUE(s_test_ctx.pool_len > 0);
+    TEST_ASSERT_TRUE(s_test_ctx.pool.head > 0);
 }
 
 static void worker_tx_task1(void* pv) {
@@ -199,7 +199,7 @@ static void worker_tx_task1(void* pv) {
             .temp_milli = 20000 + i,
             .is_active = true,
         };
-        zp_emit(ctx, ACTION_UPDATE_DATA, &s);
+        zp_send(ctx, ACTION_UPDATE_DATA, &s, 1);
     }
     xSemaphoreGive(s_done_sem);
     vTaskDelete(NULL);
@@ -208,7 +208,7 @@ static void worker_tx_task1(void* pv) {
 static void worker_tx_task2(void* pv) {
     zp_ctx_t* ctx = (zp_ctx_t*)pv;
     for (int i = 0; i < 20; i++) {
-        zp_emit(ctx, ACTION_PING);
+        zp_send(ctx, ACTION_PING, NULL, 0);
     }
     xSemaphoreGive(s_done_sem);
     vTaskDelete(NULL);
@@ -235,8 +235,8 @@ TEST_CASE(
         .schema = &test_schema,
         .transport = &s_test_tcp,
         .writev = zp_tcp_writev,
-        ZP_BUFFER(rx, s_test_rx),
-        ZP_BUFFER(pool, s_test_pool),
+        .buf = {.data = s_test_rx, .cap = sizeof(s_test_rx)},
+        .pool = {.data = s_test_pool, .cap = sizeof(s_test_pool)},
     };
     TEST_ASSERT_NOT_NULL(zp_init(&s_test_ctx));
 
@@ -268,12 +268,12 @@ TEST_CASE(
     close(fds[0]);
 }
 
-TEST_CASE("RX: pull-based zp_poll decoding in FreeRTOS environment", "[rx]") {
+TEST_CASE("RX: pull-based zp_recv decoding in FreeRTOS environment", "[rx]") {
     zp_ctx_t rx_ctx = {
         .schema = &test_schema,
         .writev = dummy_writev,
-        ZP_BUFFER(rx, s_rx),
-        ZP_BUFFER(pool, s_pool),
+        .buf = {.data = s_rx, .cap = sizeof(s_rx)},
+        .pool = {.data = s_pool, .cap = sizeof(s_pool)},
     };
     TEST_ASSERT_NOT_NULL(zp_init(&rx_ctx));
 
@@ -282,14 +282,14 @@ TEST_CASE("RX: pull-based zp_poll decoding in FreeRTOS environment", "[rx]") {
         .type_id = 0,
         .count = 0,
     };
-    memcpy(rx_ctx.rx_buf, &ping_hdr, sizeof(ping_hdr));
-    rx_ctx.rx_head = sizeof(ping_hdr);
+    memcpy(rx_ctx.buf.data, &ping_hdr, sizeof(ping_hdr));
+    rx_ctx.buf.head = sizeof(ping_hdr);
 
     zp_msg_t msg;
-    TEST_ASSERT_TRUE(zp_poll(&rx_ctx, &msg));
+    TEST_ASSERT_TRUE(zp_recv(&rx_ctx, &msg));
     TEST_ASSERT_EQUAL_UINT8(0, msg.action);
     TEST_ASSERT_NULL(msg.payload);
-    TEST_ASSERT_FALSE(zp_poll(&rx_ctx, &msg));
+    TEST_ASSERT_FALSE(zp_recv(&rx_ctx, &msg));
 }
 
 static void mock_tcp_worker(void* pv) {
@@ -304,8 +304,8 @@ static void mock_tcp_worker(void* pv) {
         .type_id = 0,
         .count = 0,
     };
-    memcpy(ctx->rx_buf + ctx->rx_head, &hdr, sizeof(hdr));
-    ctx->rx_head += sizeof(hdr);
+    memcpy(ctx->buf.data + ctx->buf.head, &hdr, sizeof(hdr));
+    ctx->buf.head += sizeof(hdr);
 
     // Notify app task that bytes arrived
     if (tcp->app_task) {
@@ -337,8 +337,8 @@ TEST_CASE(
         .schema = &test_schema,
         .transport = &mock_tcp,
         .writev = dummy_writev,
-        ZP_BUFFER(rx, mock_rx),
-        ZP_BUFFER(pool, mock_pool),
+        .buf = {.data = mock_rx, .cap = sizeof(mock_rx)},
+        .pool = {.data = mock_pool, .cap = sizeof(mock_pool)},
     };
     TEST_ASSERT_NOT_NULL(zp_init(&mock_ctx));
 
@@ -361,7 +361,7 @@ TEST_CASE(
 
     // Verify packet can now be polled
     zp_msg_t msg;
-    TEST_ASSERT_TRUE(zp_poll(&mock_ctx, &msg));
+    TEST_ASSERT_TRUE(zp_recv(&mock_ctx, &msg));
     TEST_ASSERT_EQUAL_UINT8(0, msg.action);
 
     // Wake mock_tcp back up

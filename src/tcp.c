@@ -59,8 +59,8 @@ static void zp_tcp_task(void* pvParameters) {
         );
 
         while (1) {
-            size_t avail = zp_rx_avail(ctx);
-            uint8_t* buf = zp_rx_buf(ctx);
+            size_t avail;
+            void* buf = zp_buffer(ctx, &avail);
 
             if (!buf || avail == 0) {
                 ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
@@ -79,7 +79,7 @@ static void zp_tcp_task(void* pvParameters) {
                 break;
             }
 
-            ctx->rx_head += len;
+            ctx->buf.head += len;
 
             if (tcp->app_task) {
                 xTaskNotifyGive(tcp->app_task);
