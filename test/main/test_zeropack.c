@@ -4,6 +4,8 @@
 #include "freertos/semphr.h"
 #include "unity.h"
 #include "unity_test_runner.h"
+
+#define ZP_IMPLEMENTATION
 #include "zeropack.h"
 #include "zeropack/tcp.h"
 
@@ -19,7 +21,7 @@
     T(ACTION_UPDATE_DATA, sensor_t) \
     A(ACTION_SEND_BUFFER, u8)
 
-ZP_DECLARE(TEST_TYPES, TEST_ACTIONS)
+ZP_TYPES(TEST_TYPES)
 ZP_SCHEMA(test_schema, TEST_TYPES, TEST_ACTIONS)
 
 static zp_ctx_t s_ctx;
@@ -305,7 +307,7 @@ static void mock_tcp_worker(void* pv) {
         .count = 0,
     };
     memcpy(ctx->buf.data + ctx->buf.head, &hdr, sizeof(hdr));
-    ctx->buf.head += sizeof(hdr);
+    zp_commit(ctx, sizeof(hdr));
 
     // Notify app task that bytes arrived
     if (tcp->app_task) {

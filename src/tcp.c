@@ -79,7 +79,7 @@ static void zp_tcp_task(void* pvParameters) {
                 break;
             }
 
-            ctx->buf.head += len;
+            zp_commit(ctx, len);
 
             if (tcp->app_task) {
                 xTaskNotifyGive(tcp->app_task);
